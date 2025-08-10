@@ -1,0 +1,6 @@
+Django
+PyMySQL
+djangorestframework
+drf-nested-routers
+djangorestframework-simplejwt
+django-filter

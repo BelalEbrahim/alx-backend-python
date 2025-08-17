@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Config
+SERVICE="django-messaging"
+BLUE_DEPLOY="django-messaging-blue"
+BLUE_YAML="blue_deployment.yaml"
+LOCAL_PORT=8080
+REMOTE_PORT=8000
+ROLLOUT_TIMEOUT=120   # seconds
+PF_WAIT_TIMEOUT=10    # seconds to wait for port-forward to accept connections
+PROBE_INTERVAL=1      # seconds between probes
+
+# Helpers
+info(){ printf "→ %s\n" "$*"; }
+err(){ printf "ERROR: %s\n" "$*" >&2; }
+safe_kill() { [ -n "${1:-}" ] && kill "$1" >/dev/null 2>&1 || true; }
+
+# Preconditions
+command -v kubectl >/dev/null 2>&1 || { err "kubectl not found"; exit 1; }
+command -v curl >/dev/null 2>&1 || { err "curl not found"; exit 1; }
+
+# Ensure blue yaml exists
+if [[ ! -f "$BLUE_YAML" ]]; then
+  err "Required file '$BLUE_YAML' not found."
+  exit 1
+fi
+
+# Optional: ensure stable Service points to BLUE while we roll it (ignore failure)
+kubectl patch service "${SERVICE}" \
+  --type merge \
+  -p '{"spec":{"selector":{"app":"django-messaging","version":"blue"}}}' >/dev/null 2>&1 || true
+
+# Temp log for downtime probe
+TMP_LOG="$(mktemp /tmp/downtime-XXXXXX.log)"
+PF_PID=""
+CURL_PID=""
+
+cleanup() {
+  info "Cleaning up..."
+  safe_kill "${CURL_PID:-}"
+  safe_kill "${PF_PID:-}"
+  # wait for background processes to exit (avoid zombie)
+  sleep 1
+  if [[ -f "$TMP_LOG" ]]; then
+    info "Probe log: $TMP_LOG"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+echo "[1/4] Port-forward stable service on :${LOCAL_PORT}"
+kubectl port-forward "svc/${SERVICE}" "${LOCAL_PORT}:${REMOTE_PORT}" >/dev/null 2>&1 &
+PF_PID=$!
+
+# Wait for port-forward to accept connections
+info "Waiting up to ${PF_WAIT_TIMEOUT}s for port-forward to be ready..."
+elapsed=0
+while true; do
+  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${LOCAL_PORT}/"; then
+    info "Port-forward is responding."
+    break
+  fi
+  if [[ $elapsed -ge $PF_WAIT_TIMEOUT ]]; then
+    err "Port-forward failed to respond within ${PF_WAIT_TIMEOUT}s."
+    exit 2
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+
+echo "[2/4] Start downtime probe (curl every ${PROBE_INTERVAL}s)"
+(
+  while true; do
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${LOCAL_PORT}/" || echo "000")
+    printf "%s HTTP %s\n" "$(date +%T)" "${CODE}" | tee -a "$TMP_LOG"
+    sleep "${PROBE_INTERVAL}"
+  done
+) &
+CURL_PID=$!
+
+echo "[3/4] Apply updated BLUE deployment (rolling update to image 2.0)"
+kubectl apply -f "$BLUE_YAML"
+kubectl rollout status "deploy/${BLUE_DEPLOY}" --timeout="${ROLLOUT_TIMEOUT}s"
+
+echo "[4/4] Verify pods after rollout"
+kubectl get pods -l app=django-messaging -o wide
+
+# Stop background jobs (cleanup will also attempt)
+safe_kill "$CURL_PID"
+safe_kill "$PF_PID"
+
+# Quick downtime check: did we ever log a non-200/301/302?
+if grep -E "HTTP (000|4..|5..)" "$TMP_LOG" >/dev/null; then
+  echo ">>> Possible disruption detected — see probe log: $TMP_LOG"
+  exit 3
+else
+  echo ">>> No downtime detected (HTTP looked good). Probe log: $TMP_LOG"
+fi

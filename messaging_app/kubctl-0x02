@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Config
+TIMEOUT=120  # seconds for rollout wait
+BLUE_DEPLOY="django-messaging-blue"
+GREEN_DEPLOY="django-messaging-green"
+STABLE_SVC="django-messaging"
+BLUE_SVC="django-messaging-blue"
+GREEN_SVC="django-messaging-green"
+APP_LABEL="app=django-messaging,version=green"
+
+info() { printf "→ %s\n" "$*"; }
+err()  { printf "ERROR: %s\n" "$*" >&2; exit 1; }
+
+# Preconditions
+command -v kubectl >/dev/null 2>&1 || err "kubectl is not installed or not in PATH."
+
+# Files to apply (edit if filenames differ)
+FILES=(blue_deployment.yaml green_deployment.yaml kubeservice.yaml)
+
+info "[1/5] Applying BLUE/GREEN deployments and services"
+for f in "${FILES[@]}"; do
+  if [[ ! -f $f ]]; then
+    err "Required file '$f' not found."
+  fi
+  kubectl apply -f "$f"
+done
+
+info "[2/5] Waiting for rollouts"
+kubectl rollout status "deploy/${BLUE_DEPLOY}" --timeout="${TIMEOUT}s"
+kubectl rollout status "deploy/${GREEN_DEPLOY}" --timeout="${TIMEOUT}s"
+
+info "[3/5] Checking GREEN pod logs (last 50 lines)"
+GREEN_POD="$(kubectl get pods -l "${APP_LABEL}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+if [[ -z "${GREEN_POD}" ]]; then
+  err "No GREEN pod found (label: ${APP_LABEL}). Aborting switch."
+fi
+kubectl logs "${GREEN_POD}" --tail=50 || true
+
+info "[4/5] Switching stable Service from BLUE -> GREEN"
+kubectl patch service "${STABLE_SVC}" \
+  --type merge \
+  -p '{"spec":{"selector":{"app":"django-messaging","version":"green"}}}'
+
+info "[5/5] Verifying Endpoints now point to GREEN"
+kubectl get endpoints "${STABLE_SVC}" -o wide
+kubectl get svc "${STABLE_SVC}" -o wide
+
+cat <<'EOF'
+
+Done!
+
+Quick tests:
+- Test BLUE directly:  kubectl port-forward svc/django-messaging-blue 8081:8000
+- Test GREEN directly: kubectl port-forward svc/django-messaging-green 8082:8000
+- Test STABLE:         kubectl port-forward svc/django-messaging 8080:8000
+
+Rollback to BLUE (if needed):
+kubectl patch service django-messaging \
+  --type merge \
+  -p '{"spec":{"selector":{"app":"django-messaging","version":"blue"}}}'
+EOF

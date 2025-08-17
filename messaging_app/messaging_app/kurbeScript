@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Simple: start minikube, wait for node Ready, list pods
+set -e
+
+# quick checks
+command -v minikube >/dev/null 2>&1 || { echo "minikube not found"; exit 1; }
+command -v kubectl >/dev/null 2>&1 || { echo "kubectl not found"; exit 1; }
+
+echo "Starting minikube..."
+minikube start
+
+echo "Checking cluster..."
+kubectl cluster-info >/dev/null 2>&1 || { echo "kubectl cannot reach cluster"; exit 1; }
+
+# wait up to 60s for a Ready node
+timeout=60
+elapsed=0
+interval=5
+echo "Waiting for node to be Ready (timeout ${timeout}s)..."
+while ! kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -q '^Ready'; do
+  if [ "$elapsed" -ge "$timeout" ]; then
+    echo "Timed out waiting for node to be Ready"; kubectl get nodes || true; exit 2
+  fi
+  sleep "$interval"
+  elapsed=$((elapsed + interval))
+done
+
+echo "Node is Ready. Pods:"
+kubectl get pods --all-namespaces

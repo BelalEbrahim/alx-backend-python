@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Simple updater: scale deployment, wait for readiness, port-forward, optional load test, cleanup.
+set -euo pipefail
+
+# Config (edit if needed)
+DEPLOYMENT="django-messaging"
+LABEL="app=django-messaging"
+REPLICAS=3
+WAIT_TIMEOUT=120   # seconds to wait for rollout / pods
+PF_LOCAL_PORT=8000
+PF_REMOTE_PORT=8000
+
+# Helpers
+err() { echo "ERROR: $*" >&2; }
+info() { echo "→ $*"; }
+
+# Preconditions
+command -v kubectl >/dev/null 2>&1 || { err "kubectl not found"; exit 1; }
+
+# Ensure deployment exists
+if ! kubectl get deployment "${DEPLOYMENT}" >/dev/null 2>&1; then
+  err "Deployment '${DEPLOYMENT}' not found in the current namespace."
+  exit 1
+fi
+
+# Scale
+info "Scaling ${DEPLOYMENT} to ${REPLICAS} replicas..."
+kubectl scale deployment/"${DEPLOYMENT}" --replicas="${REPLICAS}"
+
+# Rollout status (with timeout)
+info "Waiting for rollout to finish (timeout ${WAIT_TIMEOUT}s)..."
+kubectl rollout status deployment/"${DEPLOYMENT}" --timeout="${WAIT_TIMEOUT}s"
+
+# Wait for pods to be Ready
+info "Waiting for pods with label ${LABEL} to become Ready..."
+kubectl wait --for=condition=ready pod -l "${LABEL}" --timeout="${WAIT_TIMEOUT}s"
+
+# Show pods
+info "Running pods:"
+kubectl get pods -l "${LABEL}"
+
+# Decide port-forward target: prefer service if present, else the first pod
+if kubectl get svc "${DEPLOYMENT}" >/dev/null 2>&1; then
+  TARGET="svc/${DEPLOYMENT}"
+else
+  POD_NAME=$(kubectl get pods -l "${LABEL}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [ -z "${POD_NAME}" ]; then
+    err "No pod to port-forward to."
+    exit 1
+  fi
+  TARGET="pod/${POD_NAME}"
+fi
+
+# Start port-forward in background and ensure cleanup
+info "Starting port-forward (${TARGET}) -> localhost:${PF_LOCAL_PORT} ..."
+kubectl port-forward "${TARGET}" "${PF_LOCAL_PORT}:${PF_REMOTE_PORT}" >/dev/null 2>&1 &
+PF_PID=$!
+
+cleanup() {
+  info "Cleaning up..."
+  if [ -n "${PF_PID:-}" ]; then
+    kill "${PF_PID}" 2>/dev/null || true
+    wait "${PF_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# Give port-forward a moment
+sleep 2
+
+# Optional: load test with wrk
+if command -v wrk >/dev/null 2>&1; then
+  info "Running load test (10s) against http://localhost:${PF_LOCAL_PORT}/ ..."
+  wrk -t4 -c32 -d10s "http://localhost:${PF_LOCAL_PORT}/"
+else
+  info "wrk not installed — skipping load test"
+fi
+
+# Optional: show resource usage
+if kubectl top pods >/dev/null 2>&1; then
+  info "Pod resource usage:"
+  kubectl top pods -l "${LABEL}" || true
+else
+  info "metrics-server / 'kubectl top' not available — skipping usage stats"
+fi
+
+info "Done."
+# cleanup() will run via trap

@@ -1,0 +1,74 @@
+pipeline {
+  agent any
+  environment {
+    DOCKERHUB_REPO = 'ashrafmagdy92/alx-repo'
+    IMAGE_TAG = "messaging-app-${env.BUILD_ID}"
+  }
+  
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'main', 
+             url: 'https://github.com/Ashraf-Magdy-Mostafa/alx-backend-python.git', 
+             credentialsId: 'github-creds'
+      }
+    }
+    
+    stage('Test') {
+      steps {
+        dir('messaging_app') {
+          sh '''
+            python -m pip install --upgrade pip
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
+            pip install pytest
+            python -m pytest --junitxml=pytest.xml -v
+          '''
+        }
+      }
+      post {
+        always {
+          junit 'messaging_app/pytest.xml'
+        }
+      }
+    }
+    
+    stage('Docker Build') {
+      steps {
+        dir('messaging_app') {
+          sh "docker build -t ${DOCKERHUB_REPO}:${IMAGE_TAG} ."
+        }
+      }
+    }
+    
+    stage('Docker Push') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'dockerhub-creds',
+          usernameVariable: 'DOCKERHUB_USER',
+          passwordVariable: 'DOCKERHUB_PASS'
+        )]) {
+          sh """
+            echo "${DOCKERHUB_PASS}" | docker login -u "${DOCKERHUB_USER}" --password-stdin
+            docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+            docker tag ${DOCKERHUB_REPO}:${IMAGE_TAG} ${DOCKERHUB_REPO}:latest
+            docker push ${DOCKERHUB_REPO}:latest
+          """
+        }
+      }
+    }
+  }
+  
+  post {
+    always {
+      cleanWs()
+    }
+    success { 
+      echo "✅ Image pushed: ${DOCKERHUB_REPO}:${IMAGE_TAG}" 
+    }
+    failure { 
+      echo "❌ Build failed. Check logs and test report." 
+    }
+  }
+}
